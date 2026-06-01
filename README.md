@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/collider-immune-system-hero.png" alt="Collider Immune System hero banner" width="100%">
+</p>
+
 # Collider Immune System
 
 A local pi extension suite that forces distant-domain collisions, quarantines generic AI slop, and remembers fertile principles for better repo-specific ideas.
