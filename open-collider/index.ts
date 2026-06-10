@@ -2,10 +2,15 @@ import { mkdirSync, appendFileSync, readFileSync, writeFileSync, existsSync } fr
 import { dirname, join } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
-const RANDOM_SUMMARY_URL = "https://en.wikipedia.org/api/rest_v1/page/random/summary";
+// One Action API call returns 20 random article intros; the per-article REST
+// random/summary endpoint rate-limits concurrent callers with 429s.
+const ACTION_API_URL =
+	"https://en.wikipedia.org/w/api.php?action=query&format=json&formatversion=2" +
+	"&generator=random&grnnamespace=0&grnfilterredir=nonredirects&grnlimit=20" +
+	"&prop=extracts%7Cdescription%7Cinfo&exintro=1&explaintext=1&inprop=url";
+const USER_AGENT = "open-collider-pi-extension/1.0 (https://github.com/eSaadster/pi-collider-immune-system)";
 const MIN_EXTRACT_CHARS = 350;
-const FETCH_BATCH_SIZE = 6;
-const MAX_FETCH_BATCHES = 6;
+const MAX_DRAW_ROUNDS = 3;
 const RECENT_LOG_WINDOW = 40;
 
 type Mode = "standard" | "deep";
@@ -80,37 +85,50 @@ function recentTitles(cwd: string): Set<string> {
 	return titles;
 }
 
-async function fetchRandomSource(): Promise<Source | null> {
-	const res = await fetch(RANDOM_SUMMARY_URL, { headers: { accept: "application/json" } });
-	if (!res.ok) return null;
+async function fetchRandomBatch(): Promise<Source[]> {
+	const res = await fetch(ACTION_API_URL, {
+		headers: { accept: "application/json", "user-agent": USER_AGENT },
+	});
+	if (!res.ok) throw new Error(`Wikipedia API returned HTTP ${res.status}`);
 	const data: any = await res.json();
-	if (data?.type !== "standard") return null;
-	const extract = typeof data?.extract === "string" ? data.extract.trim() : "";
-	if (extract.length < MIN_EXTRACT_CHARS) return null;
-	return {
-		title: String(data.title ?? "Untitled"),
-		description: typeof data.description === "string" ? data.description : "",
-		extract,
-		url: String(data?.content_urls?.desktop?.page ?? ""),
-	};
+	const pages: any[] = Array.isArray(data?.query?.pages) ? data.query.pages : [];
+	return pages.flatMap((page) => {
+		const extract = typeof page?.extract === "string" ? page.extract.trim() : "";
+		const description = typeof page?.description === "string" ? page.description : "";
+		if (extract.length < MIN_EXTRACT_CHARS) return [];
+		if (/disambiguation|topics referred to by the same term/i.test(description)) return [];
+		return [
+			{
+				title: String(page.title ?? "Untitled"),
+				description,
+				extract,
+				url: String(page.fullurl ?? ""),
+			},
+		];
+	});
 }
 
-async function drawSources(count: number, exclude: Set<string>): Promise<Source[]> {
+async function drawSources(
+	count: number,
+	exclude: Set<string>,
+): Promise<{ sources: Source[]; error: string | null }> {
 	const sources: Source[] = [];
 	const seen = new Set<string>();
-	for (let batch = 0; batch < MAX_FETCH_BATCHES && sources.length < count; batch++) {
-		const results = await Promise.all(
-			Array.from({ length: FETCH_BATCH_SIZE }, () => fetchRandomSource().catch(() => null)),
-		);
-		for (const source of results) {
-			if (!source || sources.length >= count) continue;
-			const key = source.title.toLowerCase();
-			if (seen.has(key) || exclude.has(key)) continue;
-			seen.add(key);
-			sources.push(source);
+	let error: string | null = null;
+	for (let round = 0; round < MAX_DRAW_ROUNDS && sources.length < count; round++) {
+		try {
+			for (const source of await fetchRandomBatch()) {
+				if (sources.length >= count) break;
+				const key = source.title.toLowerCase();
+				if (seen.has(key) || exclude.has(key)) continue;
+				seen.add(key);
+				sources.push(source);
+			}
+		} catch (e: any) {
+			error = e?.message ?? String(e);
 		}
 	}
-	return sources;
+	return { sources, error };
 }
 
 function phaseAPrompt(sources: Source[], mode: Mode): string {
@@ -205,13 +223,11 @@ export default function openColliderExtension(pi: ExtensionAPI) {
 		ctx.ui.setStatus("open-collider", "drawing");
 		ctx.ui.notify(`Drawing ${count} random sources...`, "info");
 
-		const sources = await drawSources(count, recentTitles(ctx.cwd));
+		const { sources, error } = await drawSources(count, recentTitles(ctx.cwd));
 		if (sources.length < count) {
 			ctx.ui.setStatus("open-collider", "idle");
-			ctx.ui.notify(
-				`Could only draw ${sources.length}/${count} usable sources (network or stub filtering). Try again.`,
-				"warning",
-			);
+			const reason = error ? ` Last error: ${error}` : " All candidates were stubs; try again.";
+			ctx.ui.notify(`Could only draw ${sources.length}/${count} usable sources.${reason}`, "warning");
 			return;
 		}
 
