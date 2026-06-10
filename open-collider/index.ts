@@ -2,16 +2,45 @@ import { mkdirSync, appendFileSync, readFileSync, writeFileSync, existsSync } fr
 import { dirname, join } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
+const API_BASE = "https://en.wikipedia.org/w/api.php";
 // One Action API call returns 20 random article intros; the per-article REST
 // random/summary endpoint rate-limits concurrent callers with 429s.
-const ACTION_API_URL =
-	"https://en.wikipedia.org/w/api.php?action=query&format=json&formatversion=2" +
+const RANDOM_API_URL =
+	`${API_BASE}?action=query&format=json&formatversion=2` +
 	"&generator=random&grnnamespace=0&grnfilterredir=nonredirects&grnlimit=20" +
-	"&prop=extracts%7Cdescription%7Cinfo&exintro=1&explaintext=1&inprop=url";
+	"&prop=extracts%7Cdescription%7Cinfo&exintro=1&explaintext=1&exlimit=max&inprop=url";
 const USER_AGENT = "open-collider-pi-extension/1.0 (https://github.com/eSaadster/pi-collider-immune-system)";
 const MIN_EXTRACT_CHARS = 350;
 const MAX_DRAW_ROUNDS = 3;
 const RECENT_LOG_WINDOW = 40;
+
+// Mechanism-dense index pages whose outgoing links form the curated draw pool.
+const SEED_LISTS = [
+	"List of paradoxes",
+	"List of cognitive biases",
+	"List of fallacies",
+	"List of eponymous laws",
+	"List of thought experiments",
+	"Philosophical razor",
+	"Glossary of game theory",
+	"List of games in game theory",
+	"List of effects",
+	"Glossary of economics",
+	"Glossary of philosophy",
+];
+const POOL_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+const POOL_PAGES_PER_LIST = 3; // pllimit=max returns 500 links per request
+const EXTRACT_BATCH = 18; // prop=extracts with exintro caps exlimit at 20 per query
+const WILDCARD_SLOTS = 1;
+
+// Wildcard (true-random) draws must positively look like a concept/mechanism;
+// pool draws are already curated, so they only need to dodge obvious junk
+// (seed lists link to contextual pages too, e.g. people mentioned in a paradox).
+const DESCRIPTION_ALLOWLIST =
+	/\b(concept|theory|theorem|principle|paradox|phenomenon|effect|law|bias|heuristic|strategy|strategies|problem|method|model|fallacy|dilemma|razor|adage|maxim|hypothesis|experiment|game theory|argument|rule|reasoning|logic|economics|philosophy|psychology|mechanism|process|system|technique|framework)\b/i;
+const DESCRIPTION_BLOCKLIST =
+	/\b(footballer|cricketer|athlete|politician|singer|songwriter|actor|actress|musician|rapper|novelist|poet|painter|journalist|album|song|single|film|movie|tour|band|tv series|television series|episode|video game|role-playing game|board game|card game|comics|manga|village|town|city|municipality|district|county|country|continent|island|ocean|planet|river|lake|mountain|species|genus|gene|protein|railway|station|stadium|church|school|university|surname|given name|football club|monarch|emperor|dictator|philosopher|theologian|economist|mathematician|physicist|chemist|biologist|scientist|psychologist|sociologist|historian|scholar)\b/i;
+const PERSON_YEARS = /\(\s*born\b|\bborn \d{4}|\b\d{2,4}\s*[–—-]\s*\d{2,4}\s*(?:BC|BCE|AD|CE)?\s*\)/i;
 
 type Mode = "standard" | "deep";
 
@@ -20,13 +49,14 @@ type Source = {
 	description: string;
 	extract: string;
 	url: string;
+	origin: string;
 };
 
 type LogEntry = {
 	timestamp: number;
 	mode: Mode;
 	question: string;
-	sources: { title: string; url: string }[];
+	sources: { title: string; url: string; origin?: string }[];
 	verdict: string | null;
 };
 
@@ -37,8 +67,15 @@ type ActiveCollision = {
 	sources: Source[];
 };
 
+type PoolEntry = { title: string; list: string };
+type Pool = { builtAt: number; entries: PoolEntry[] };
+
 function logPath(cwd: string): string {
 	return join(cwd, ".pi", "open-collider", "collisions.jsonl");
+}
+
+function poolPath(cwd: string): string {
+	return join(cwd, ".pi", "open-collider", "pool.json");
 }
 
 function ensureLogFile(cwd: string): string {
@@ -85,49 +122,264 @@ function recentTitles(cwd: string): Set<string> {
 	return titles;
 }
 
+function shuffle<T>(items: T[]): T[] {
+	const arr = [...items];
+	for (let i = arr.length - 1; i > 0; i--) {
+		const j = Math.floor(Math.random() * (i + 1));
+		[arr[i], arr[j]] = [arr[j], arr[i]];
+	}
+	return arr;
+}
+
+// Equal draw probability per seed list, so large glossaries (which link many
+// broad survey articles) don't drown out the dense paradox/law/bias lists.
+function interleaveByList(entries: PoolEntry[]): PoolEntry[] {
+	const groups = new Map<string, PoolEntry[]>();
+	for (const entry of shuffle(entries)) {
+		const group = groups.get(entry.list) ?? [];
+		group.push(entry);
+		groups.set(entry.list, group);
+	}
+	const buckets = shuffle([...groups.values()]);
+	const result: PoolEntry[] = [];
+	for (let i = 0; result.length < entries.length; i++) {
+		for (const bucket of buckets) {
+			if (i < bucket.length) result.push(bucket[i]);
+		}
+	}
+	return result;
+}
+
+function parsePage(page: any, origin: string): Source | null {
+	const extract = typeof page?.extract === "string" ? page.extract.trim() : "";
+	if (!extract) return null;
+	return {
+		title: String(page.title ?? "Untitled"),
+		description: typeof page?.description === "string" ? page.description : "",
+		extract,
+		url: String(page.fullurl ?? ""),
+		origin,
+	};
+}
+
+function usable(source: Source): boolean {
+	if (source.extract.length < MIN_EXTRACT_CHARS) return false;
+	if (/disambiguation|topics referred to by the same term/i.test(source.description)) return false;
+	if (/^(list|lists|index|glossary|outline|timeline) of /i.test(source.title)) return false;
+	return true;
+}
+
+function passesPoolGate(source: Source): boolean {
+	return (
+		usable(source) &&
+		!DESCRIPTION_BLOCKLIST.test(source.description) &&
+		!PERSON_YEARS.test(source.description)
+	);
+}
+
+function passesWildcardGate(source: Source): boolean {
+	return passesPoolGate(source) && DESCRIPTION_ALLOWLIST.test(source.description);
+}
+
+const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+async function apiGet(params: URLSearchParams): Promise<any> {
+	// Wikipedia 429s rapid sequential callers; back off and retry before failing.
+	for (let attempt = 0; ; attempt++) {
+		const res = await fetch(`${API_BASE}?${params}`, {
+			headers: { accept: "application/json", "user-agent": USER_AGENT },
+		});
+		if (res.ok) return res.json();
+		if ((res.status === 429 || res.status >= 500) && attempt < 2) {
+			await sleep(1500 * (attempt + 1));
+			continue;
+		}
+		throw new Error(`Wikipedia API returned HTTP ${res.status}`);
+	}
+}
+
+async function fetchSeedListLinks(list: string): Promise<string[]> {
+	const titles: string[] = [];
+	let plcontinue: string | undefined;
+	for (let page = 0; page < POOL_PAGES_PER_LIST; page++) {
+		const params = new URLSearchParams({
+			action: "query",
+			format: "json",
+			formatversion: "2",
+			prop: "links",
+			titles: list,
+			redirects: "1",
+			pllimit: "max",
+			plnamespace: "0",
+		});
+		if (plcontinue) params.set("plcontinue", plcontinue);
+		const data = await apiGet(params);
+		const links: any[] = data?.query?.pages?.[0]?.links ?? [];
+		for (const link of links) {
+			if (typeof link?.title === "string") titles.push(link.title);
+		}
+		plcontinue = data?.continue?.plcontinue;
+		if (!plcontinue) break;
+	}
+	return titles;
+}
+
+async function buildPool(cwd: string): Promise<Pool> {
+	// Sequential, not parallel: Wikipedia rate-limits concurrent callers with 429s.
+	const results: { list: string; titles: string[] }[] = [];
+	for (const list of SEED_LISTS) {
+		try {
+			results.push({ list, titles: await fetchSeedListLinks(list) });
+		} catch {
+			results.push({ list, titles: [] });
+		}
+	}
+	const seen = new Set<string>();
+	const entries: PoolEntry[] = [];
+	for (const { list, titles } of results) {
+		for (const title of titles) {
+			const key = title.toLowerCase();
+			if (seen.has(key)) continue;
+			if (/^(list of|lists of|index of|glossary of|outline of|timeline of)/i.test(title)) continue;
+			seen.add(key);
+			entries.push({ title, list });
+		}
+	}
+	const pool: Pool = { builtAt: Date.now(), entries };
+	if (entries.length > 0) {
+		const file = poolPath(cwd);
+		mkdirSync(dirname(file), { recursive: true });
+		writeFileSync(file, JSON.stringify(pool), "utf8");
+	}
+	return pool;
+}
+
+function readCachedPool(cwd: string, ignoreTtl = false): Pool | null {
+	const file = poolPath(cwd);
+	if (!existsSync(file)) return null;
+	try {
+		const pool = JSON.parse(readFileSync(file, "utf8")) as Pool;
+		if (!Array.isArray(pool.entries) || pool.entries.length === 0) return null;
+		if (!ignoreTtl && Date.now() - pool.builtAt >= POOL_TTL_MS) return null;
+		return pool;
+	} catch {
+		return null;
+	}
+}
+
+async function loadPool(cwd: string, onBuild?: () => void): Promise<Pool> {
+	const cached = readCachedPool(cwd);
+	if (cached) return cached;
+	onBuild?.();
+	return buildPool(cwd);
+}
+
+async function fetchExtractsForEntries(entries: PoolEntry[]): Promise<Source[]> {
+	if (entries.length === 0) return [];
+	const params = new URLSearchParams({
+		action: "query",
+		format: "json",
+		formatversion: "2",
+		titles: entries.map((e) => e.title).join("|"),
+		redirects: "1",
+		prop: "extracts|description|info",
+		exintro: "1",
+		explaintext: "1",
+		exlimit: "max",
+		inprop: "url",
+	});
+	const data = await apiGet(params);
+
+	// Map requested titles through normalization/redirects so each returned
+	// page can be labeled with the seed list it came from.
+	const rename = new Map<string, string>();
+	for (const r of [...(data?.query?.normalized ?? []), ...(data?.query?.redirects ?? [])]) {
+		if (r?.from && r?.to) rename.set(String(r.from), String(r.to));
+	}
+	const originByTitle = new Map<string, string>();
+	for (const entry of entries) {
+		let title = entry.title;
+		for (let hop = 0; hop < 3; hop++) title = rename.get(title) ?? title;
+		originByTitle.set(title.toLowerCase(), entry.list);
+	}
+
+	const pages: any[] = Array.isArray(data?.query?.pages) ? data.query.pages : [];
+	return pages.flatMap((page) => {
+		const source = parsePage(page, "curated pool");
+		if (!source) return [];
+		source.origin = originByTitle.get(source.title.toLowerCase()) ?? "curated pool";
+		return [source];
+	});
+}
+
 async function fetchRandomBatch(): Promise<Source[]> {
-	const res = await fetch(ACTION_API_URL, {
+	const res = await fetch(RANDOM_API_URL, {
 		headers: { accept: "application/json", "user-agent": USER_AGENT },
 	});
 	if (!res.ok) throw new Error(`Wikipedia API returned HTTP ${res.status}`);
 	const data: any = await res.json();
 	const pages: any[] = Array.isArray(data?.query?.pages) ? data.query.pages : [];
 	return pages.flatMap((page) => {
-		const extract = typeof page?.extract === "string" ? page.extract.trim() : "";
-		const description = typeof page?.description === "string" ? page.description : "";
-		if (extract.length < MIN_EXTRACT_CHARS) return [];
-		if (/disambiguation|topics referred to by the same term/i.test(description)) return [];
-		return [
-			{
-				title: String(page.title ?? "Untitled"),
-				description,
-				extract,
-				url: String(page.fullurl ?? ""),
-			},
-		];
+		const source = parsePage(page, "wildcard");
+		return source ? [source] : [];
 	});
 }
 
 async function drawSources(
 	count: number,
 	exclude: Set<string>,
+	cwd: string,
+	onPoolBuild?: () => void,
 ): Promise<{ sources: Source[]; error: string | null }> {
 	const sources: Source[] = [];
 	const seen = new Set<string>();
 	let error: string | null = null;
+
+	const take = (source: Source, target: number, gate: (s: Source) => boolean): void => {
+		if (sources.length >= target) return;
+		const key = source.title.toLowerCase();
+		if (seen.has(key) || exclude.has(key)) return;
+		if (!gate(source)) return;
+		seen.add(key);
+		sources.push(source);
+	};
+
+	const pool = await loadPool(cwd, onPoolBuild);
+	const shuffled = interleaveByList(pool.entries).filter((e) => !exclude.has(e.title.toLowerCase()));
+	let cursor = 0;
+
+	const fillFromPool = async (target: number): Promise<void> => {
+		let batches = 0;
+		while (sources.length < target && cursor < shuffled.length && batches < MAX_DRAW_ROUNDS + 1) {
+			const batch = shuffled.slice(cursor, cursor + EXTRACT_BATCH);
+			cursor += EXTRACT_BATCH;
+			batches++;
+			try {
+				for (const source of await fetchExtractsForEntries(batch)) {
+					take(source, target, passesPoolGate);
+				}
+			} catch (e: any) {
+				error = e?.message ?? String(e);
+			}
+		}
+	};
+
+	// Curated slots first, then one true-random wildcard slot gated by the
+	// description allowlist, then backfill from the pool if the wildcard ran dry.
+	await fillFromPool(Math.max(0, count - WILDCARD_SLOTS));
+
 	for (let round = 0; round < MAX_DRAW_ROUNDS && sources.length < count; round++) {
 		try {
 			for (const source of await fetchRandomBatch()) {
-				if (sources.length >= count) break;
-				const key = source.title.toLowerCase();
-				if (seen.has(key) || exclude.has(key)) continue;
-				seen.add(key);
-				sources.push(source);
+				take(source, count, passesWildcardGate);
 			}
 		} catch (e: any) {
 			error = e?.message ?? String(e);
 		}
 	}
+
+	await fillFromPool(count);
+
 	return { sources, error };
 }
 
@@ -214,16 +466,31 @@ function summarizeLog(entries: LogEntry[]): string {
 	return lines.join("\n");
 }
 
+function summarizePool(pool: Pool | null): string {
+	if (!pool) return "No source pool built yet. It is built on the first /collide, or run /collider-pool rebuild.";
+	const counts = new Map<string, number>();
+	for (const entry of pool.entries) counts.set(entry.list, (counts.get(entry.list) ?? 0) + 1);
+	const ageDays = Math.max(0, Math.round((Date.now() - pool.builtAt) / 86_400_000));
+	const lines = [`Curated source pool: ${pool.entries.length} articles, built ${ageDays} day(s) ago`];
+	for (const [list, n] of [...counts.entries()].sort((a, b) => b[1] - a[1])) {
+		lines.push(`- ${list}: ${n}`);
+	}
+	return lines.join("\n");
+}
+
 export default function openColliderExtension(pi: ExtensionAPI) {
 	let active: ActiveCollision | null = null;
 	let last: { question: string; mode: Mode } | null = null;
 
 	async function startCollision(question: string, mode: Mode, ctx: any): Promise<void> {
 		const count = mode === "deep" ? 2 : 3;
+		const curated = Math.max(0, count - WILDCARD_SLOTS);
 		ctx.ui.setStatus("open-collider", "drawing");
-		ctx.ui.notify(`Drawing ${count} random sources...`, "info");
+		ctx.ui.notify(`Drawing ${count} sources (${curated} curated + ${WILDCARD_SLOTS} wildcard)...`, "info");
 
-		const { sources, error } = await drawSources(count, recentTitles(ctx.cwd));
+		const { sources, error } = await drawSources(count, recentTitles(ctx.cwd), ctx.cwd, () =>
+			ctx.ui.notify("Building curated source pool from seed lists (first run, ~10-20s)...", "info"),
+		);
 		if (sources.length < count) {
 			ctx.ui.setStatus("open-collider", "idle");
 			const reason = error ? ` Last error: ${error}` : " All candidates were stubs; try again.";
@@ -233,6 +500,10 @@ export default function openColliderExtension(pi: ExtensionAPI) {
 
 		active = { question, mode, phase: "A", sources };
 		last = { question, mode };
+		ctx.ui.notify(
+			`Drew: ${sources.map((s) => (s.origin === "wildcard" ? `${s.title} (wildcard)` : s.title)).join(" + ")}`,
+			"info",
+		);
 		ctx.ui.setStatus("open-collider", "phase A: blind extraction");
 		pi.sendUserMessage(phaseAPrompt(sources, mode));
 	}
@@ -259,7 +530,7 @@ export default function openColliderExtension(pi: ExtensionAPI) {
 			timestamp: Date.now(),
 			mode: active.mode,
 			question: active.question,
-			sources: active.sources.map((s) => ({ title: s.title, url: s.url })),
+			sources: active.sources.map((s) => ({ title: s.title, url: s.url, origin: s.origin })),
 			verdict: null,
 		});
 		active = null;
@@ -338,6 +609,29 @@ export default function openColliderExtension(pi: ExtensionAPI) {
 				{ triggerTurn: false, deliverAs: "nextTurn" },
 			);
 			ctx.ui.notify("Collision log added to transcript.", "info");
+		},
+	});
+
+	pi.registerCommand("collider-pool", {
+		description: "Show the curated source pool stats; /collider-pool rebuild to refresh it",
+		handler: async (args, ctx) => {
+			if (args.trim().toLowerCase() === "rebuild") {
+				ctx.ui.setStatus("open-collider", "building pool");
+				ctx.ui.notify("Rebuilding curated source pool from seed lists...", "info");
+				const pool = await buildPool(ctx.cwd);
+				ctx.ui.setStatus("open-collider", "idle");
+				ctx.ui.notify(`Pool rebuilt: ${pool.entries.length} articles from ${SEED_LISTS.length} seed lists.`, "info");
+				return;
+			}
+			pi.sendMessage(
+				{
+					customType: "open-collider-pool",
+					content: summarizePool(readCachedPool(ctx.cwd, true)),
+					display: true,
+				},
+				{ triggerTurn: false, deliverAs: "nextTurn" },
+			);
+			ctx.ui.notify("Pool stats added to transcript.", "info");
 		},
 	});
 }
