@@ -1,117 +1,327 @@
+import { mkdirSync, appendFileSync, readFileSync, writeFileSync, existsSync } from "node:fs";
+import { dirname, join } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { Type } from "typebox";
 
-type AskQuestionDetails = {
-	question: string;
-	reason?: string;
-	answer: string | null;
+const RANDOM_SUMMARY_URL = "https://en.wikipedia.org/api/rest_v1/page/random/summary";
+const MIN_EXTRACT_CHARS = 350;
+const FETCH_BATCH_SIZE = 6;
+const MAX_FETCH_BATCHES = 6;
+const RECENT_LOG_WINDOW = 40;
+
+type Mode = "standard" | "deep";
+
+type Source = {
+	title: string;
+	description: string;
+	extract: string;
+	url: string;
 };
 
-const OPEN_COLLIDER_METHOD = String.raw`
-You are running inside an Open Collider project extension.
+type LogEntry = {
+	timestamp: number;
+	mode: Mode;
+	question: string;
+	sources: { title: string; url: string }[];
+	verdict: string | null;
+};
 
-Open Collider exists to escape AI slop: do not move directly from the user's repo/request to obvious ideas. Before proposing product ideas, architecture changes, feature concepts, refactors, UX directions, research plans, or implementation strategies, force a collision with a structurally distant domain.
+type ActiveCollision = {
+	question: string;
+	mode: Mode;
+	phase: "A" | "B";
+	sources: Source[];
+};
 
-Required method for creative/build suggestions:
-1. Restate the local problem in structural terms, not surface terms. Identify the actual forces, constraints, incentives, failure modes, bottlenecks, feedback loops, or asymmetries in this repo/request.
-2. Choose at least one structurally distant domain that is not software/product/startups unless the user explicitly asks for those. Good domains include biology, materials science, ecology, ritual systems, logistics, cryptography, architecture, medicine, aviation, game theory, music theory, geology, maritime practice, jurisprudence, fermentation, epidemiology, theater, etc.
-3. Extract a counter-intuitive active principle from that domain. It must be a causal mechanism, not a decorative metaphor. Examples: "fragile tail controls the strong head", "slow invisible inoculation transforms the substrate", "negative space carries the load", "triangulate through provenance instead of appearance".
-4. Map the mechanism onto the repo/request. Name what corresponds to what. If the mapping is fake, discard it and pick another domain.
-5. Generate ideas that could not exist without that collision. Each proposal must carry operational consequences for this repository: files/components to change, behavior to add/remove, or a concrete experiment to run.
-6. Kill generic advice. If removing the distant-domain principle leaves the idea unchanged, it is AI slop and must not be presented as a collision.
+function logPath(cwd: string): string {
+	return join(cwd, ".pi", "open-collider", "collisions.jsonl");
+}
 
-Use the ask_question tool whenever missing context would materially change the collision space, the scoring criteria, or the next action. Prefer asking 1-3 high-leverage questions over guessing. Ask questions that expose constraints, taste, audience, unacceptable directions, or what would count as a useful weird idea.
+function ensureLogFile(cwd: string): string {
+	const file = logPath(cwd);
+	mkdirSync(dirname(file), { recursive: true });
+	if (!existsSync(file)) writeFileSync(file, "", "utf8");
+	return file;
+}
 
-Default output shape when ideating:
-- Collision domain + active principle
-- Structural mapping to this repo/request
-- Collision-born ideas, each with: proposal, why it could not arise from direct prompting, concrete repo action, strongest objection
-- Questions for the user, preferably via ask_question when an answer is needed before proceeding
-`;
+function loadLog(cwd: string): LogEntry[] {
+	const raw = readFileSync(ensureLogFile(cwd), "utf8");
+	return raw
+		.split("\n")
+		.map((line) => line.trim())
+		.filter(Boolean)
+		.flatMap((line) => {
+			try {
+				const parsed = JSON.parse(line) as LogEntry;
+				if (!parsed.question || !Array.isArray(parsed.sources)) return [];
+				return [parsed];
+			} catch {
+				return [];
+			}
+		});
+}
+
+function appendLog(cwd: string, entry: LogEntry): void {
+	appendFileSync(ensureLogFile(cwd), `${JSON.stringify(entry)}\n`, "utf8");
+}
+
+function rateLastEntry(cwd: string, verdict: string): LogEntry | null {
+	const entries = loadLog(cwd);
+	if (entries.length === 0) return null;
+	entries[entries.length - 1].verdict = verdict;
+	writeFileSync(ensureLogFile(cwd), entries.map((e) => `${JSON.stringify(e)}\n`).join(""), "utf8");
+	return entries[entries.length - 1];
+}
+
+function recentTitles(cwd: string): Set<string> {
+	const titles = new Set<string>();
+	for (const entry of loadLog(cwd).slice(-RECENT_LOG_WINDOW)) {
+		for (const source of entry.sources) titles.add(source.title.toLowerCase());
+	}
+	return titles;
+}
+
+async function fetchRandomSource(): Promise<Source | null> {
+	const res = await fetch(RANDOM_SUMMARY_URL, { headers: { accept: "application/json" } });
+	if (!res.ok) return null;
+	const data: any = await res.json();
+	if (data?.type !== "standard") return null;
+	const extract = typeof data?.extract === "string" ? data.extract.trim() : "";
+	if (extract.length < MIN_EXTRACT_CHARS) return null;
+	return {
+		title: String(data.title ?? "Untitled"),
+		description: typeof data.description === "string" ? data.description : "",
+		extract,
+		url: String(data?.content_urls?.desktop?.page ?? ""),
+	};
+}
+
+async function drawSources(count: number, exclude: Set<string>): Promise<Source[]> {
+	const sources: Source[] = [];
+	const seen = new Set<string>();
+	for (let batch = 0; batch < MAX_FETCH_BATCHES && sources.length < count; batch++) {
+		const results = await Promise.all(
+			Array.from({ length: FETCH_BATCH_SIZE }, () => fetchRandomSource().catch(() => null)),
+		);
+		for (const source of results) {
+			if (!source || sources.length >= count) continue;
+			const key = source.title.toLowerCase();
+			if (seen.has(key) || exclude.has(key)) continue;
+			seen.add(key);
+			sources.push(source);
+		}
+	}
+	return sources;
+}
+
+function phaseAPrompt(sources: Source[], mode: Mode): string {
+	const list = sources
+		.map(
+			(s, i) =>
+				`SOURCE ${i + 1}: ${s.title}${s.description ? ` — ${s.description}` : ""}\n${s.extract}\n(${s.url})`,
+		)
+		.join("\n\n");
+
+	const intersectionStep =
+		mode === "deep"
+			? `\n3. Then derive the structural INTERSECTION of the mechanisms: a single composite causal principle that only exists where these unrelated mechanisms overlap. Name it precisely.`
+			: "";
+
+	return `[Open Collider — Phase A of 2: blind mechanism extraction]
+
+The sources below were drawn at random from an external corpus. The user's actual question exists but is deliberately withheld until Phase B, so you cannot back-fit a domain to an idea you already have. Stay entirely inside each source's own domain.
+
+${list}
+
+For each source:
+1. Identify the strongest ACTIVE causal mechanism in it — what causes what, through what chain. A mechanism, not a theme, vibe, or metaphor.
+2. State what is counter-intuitive about it: where it cuts against naive expectation.${intersectionStep}
+
+Rules:
+- Do not guess at, mention, or angle toward any application, product, repo, or task.
+- Do not generalize the mechanisms into business or software lessons.
+- If a source is too thin to carry a real mechanism, say so plainly for that source.
+- End your answer after the mechanisms. Phase B arrives next.`;
+}
+
+function phaseBPrompt(question: string, mode: Mode): string {
+	const pick =
+		mode === "deep"
+			? "Use the INTERSECTION principle you derived in Phase A."
+			: "Choose the ONE Phase A mechanism with the strongest structural (not surface or thematic) fit.";
+
+	return `[Open Collider — Phase B of 2: collision]
+
+The user's actual question:
+
+"${question}"
+
+Using only the mechanisms you elaborated in Phase A:
+
+1. Restate the question in structural terms: the forces, constraints, incentives, feedback loops, asymmetries, and failure modes actually at play.
+2. ${pick} If nothing genuinely fits, say so and recommend /reroll — a forced fake mapping is worse than no mapping.
+3. Write the explicit mapping: which element of the source mechanism corresponds to which element of the question's structure.
+4. Generate 2-4 collision-born ideas. For each:
+   - the proposal
+   - why it could not arise from answering the question directly
+   - a concrete next step: an experiment, a question to investigate, a sketch, a prototype, a file to change — whatever fits the context
+   - the strongest objection against it
+5. Ablation check, one line per idea: delete the source mechanism from the idea — does the idea still stand on its own? If yes, discard it; it is generic advice wearing a costume.`;
+}
+
+function textFromMessage(message: any): string {
+	const content = message?.content;
+	if (typeof content === "string") return content;
+	if (Array.isArray(content)) {
+		return content
+			.map((part) => {
+				if (typeof part === "string") return part;
+				if (part?.type === "text" && typeof part.text === "string") return part.text;
+				if (typeof part?.text === "string") return part.text;
+				return "";
+			})
+			.join("\n");
+	}
+	return "";
+}
+
+function summarizeLog(entries: LogEntry[]): string {
+	if (entries.length === 0) return "Collision log is empty. Run /collide <question> to start.";
+	const lines = [`Collision log: ${entries.length} collision(s), newest last`];
+	for (const entry of entries.slice(-15)) {
+		const date = new Date(entry.timestamp).toISOString().slice(0, 10);
+		const titles = entry.sources.map((s) => s.title).join(" + ");
+		const verdict = entry.verdict ? ` — verdict: ${entry.verdict}` : "";
+		lines.push(`- [${date}] (${entry.mode}) "${entry.question}" × ${titles}${verdict}`);
+	}
+	return lines.join("\n");
+}
 
 export default function openColliderExtension(pi: ExtensionAPI) {
-	let enabled = true;
+	let active: ActiveCollision | null = null;
+	let last: { question: string; mode: Mode } | null = null;
+
+	async function startCollision(question: string, mode: Mode, ctx: any): Promise<void> {
+		const count = mode === "deep" ? 2 : 3;
+		ctx.ui.setStatus("open-collider", "drawing");
+		ctx.ui.notify(`Drawing ${count} random sources...`, "info");
+
+		const sources = await drawSources(count, recentTitles(ctx.cwd));
+		if (sources.length < count) {
+			ctx.ui.setStatus("open-collider", "idle");
+			ctx.ui.notify(
+				`Could only draw ${sources.length}/${count} usable sources (network or stub filtering). Try again.`,
+				"warning",
+			);
+			return;
+		}
+
+		active = { question, mode, phase: "A", sources };
+		last = { question, mode };
+		ctx.ui.setStatus("open-collider", "phase A: blind extraction");
+		pi.sendUserMessage(phaseAPrompt(sources, mode));
+	}
 
 	pi.on("session_start", async (_event, ctx) => {
-		ctx.ui.setStatus("open-collider", enabled ? "collision:on" : "collision:off");
-		ctx.ui.notify("Open Collider extension active: distant-domain collision before ideas.", "info");
+		ensureLogFile(ctx.cwd);
+		ctx.ui.setStatus("open-collider", "idle");
+		ctx.ui.notify("Open Collider ready: /collide <question> for a random-source collision.", "info");
 	});
 
-	pi.on("before_agent_start", async (event) => {
-		if (!enabled) return;
-		return {
-			systemPrompt: `${event.systemPrompt}\n\n${OPEN_COLLIDER_METHOD}`,
-		};
+	pi.on("message_end", async (event, ctx) => {
+		if (!active) return;
+		if (event.message?.role !== "assistant") return;
+		if (!textFromMessage(event.message).trim()) return;
+
+		if (active.phase === "A") {
+			active.phase = "B";
+			ctx.ui.setStatus("open-collider", "phase B: collision");
+			pi.sendUserMessage(phaseBPrompt(active.question, active.mode), { deliverAs: "followUp" });
+			return;
+		}
+
+		appendLog(ctx.cwd, {
+			timestamp: Date.now(),
+			mode: active.mode,
+			question: active.question,
+			sources: active.sources.map((s) => ({ title: s.title, url: s.url })),
+			verdict: null,
+		});
+		active = null;
+		ctx.ui.setStatus("open-collider", "idle");
+		ctx.ui.notify("Collision complete. /collision-rate <verdict> to rate it, /reroll to redraw.", "info");
 	});
 
-	pi.registerTool({
-		name: "ask_question",
-		label: "Ask Question",
-		description:
-			"Ask the user one high-leverage Open Collider clarification question before generating ideas. Use when the answer would change the collision domain, constraints, scoring criteria, or next repo action.",
-		promptSnippet: "Ask the user a high-leverage clarification question and wait for the answer.",
-		promptGuidelines: [
-			"Use ask_question before Open Collider ideation when user constraints, audience, desired weirdness, or success criteria are unclear.",
-			"Use ask_question for 1-3 high-leverage questions, not long surveys.",
-		],
-		parameters: Type.Object({
-			question: Type.String({ description: "The concise question to ask the user." }),
-			reason: Type.Optional(Type.String({ description: "Why this answer matters for the collision." })),
-			placeholder: Type.Optional(Type.String({ description: "Optional placeholder text for the answer input." })),
-		}),
-		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-			if (!ctx.hasUI) {
-				return {
-					content: [{ type: "text", text: `Question not asked because UI is unavailable: ${params.question}` }],
-					details: { question: params.question, reason: params.reason, answer: null } as AskQuestionDetails,
-					isError: true,
-				};
-			}
+	async function resolveQuestion(args: string, ctx: any): Promise<string | null> {
+		const fromArgs = args.trim();
+		if (fromArgs) return fromArgs;
+		if (!ctx.hasUI) return null;
+		const answer = await ctx.ui.input(
+			"What question or problem should the collision target?",
+			"Describe the idea space, problem, or decision...",
+		);
+		return answer?.trim() || null;
+	}
 
-			const title = params.reason ? `${params.question}\n\nWhy: ${params.reason}` : params.question;
-			const answer = await ctx.ui.input(title, params.placeholder ?? "Type your answer...");
-			const trimmed = answer?.trim() || null;
-
-			return {
-				content: [
-					{
-						type: "text",
-						text: trimmed ? `User answered: ${trimmed}` : "User did not provide an answer.",
-					},
-				],
-				details: { question: params.question, reason: params.reason, answer: trimmed } as AskQuestionDetails,
-			};
-		},
-	});
-
-	pi.registerCommand("open-collider", {
-		description: "Show the Open Collider method enforced by this project extension",
-		handler: async (_args, ctx) => {
-			ctx.ui.notify("Open Collider: structural distant-domain collision before ideation.", "info");
-			pi.sendMessage(
-				{
-					customType: "open-collider-method",
-					content: OPEN_COLLIDER_METHOD.trim(),
-					display: true,
-				},
-				{ triggerTurn: false, deliverAs: "nextTurn" },
-			);
-		},
-	});
-
-	pi.registerCommand("open-collider-mode", {
-		description: "Turn Open Collider prompt injection on/off/status: /open-collider-mode on|off|status",
+	pi.registerCommand("collide", {
+		description: "Collide a question with randomly drawn external sources: /collide <question>",
 		handler: async (args, ctx) => {
-			const arg = args.trim().toLowerCase();
-			if (arg === "on") enabled = true;
-			else if (arg === "off") enabled = false;
-			else if (arg && arg !== "status") {
-				ctx.ui.notify("Usage: /open-collider-mode on|off|status", "warning");
+			const question = await resolveQuestion(args, ctx);
+			if (!question) {
+				ctx.ui.notify("Usage: /collide <question or problem>", "warning");
 				return;
 			}
+			await startCollision(question, "standard", ctx);
+		},
+	});
 
-			ctx.ui.setStatus("open-collider", enabled ? "collision:on" : "collision:off");
-			ctx.ui.notify(`Open Collider prompt injection is ${enabled ? "ON" : "OFF"}.`, "info");
+	pi.registerCommand("collide-deep", {
+		description: "Two-source intersection collision (weirder, noisier): /collide-deep <question>",
+		handler: async (args, ctx) => {
+			const question = await resolveQuestion(args, ctx);
+			if (!question) {
+				ctx.ui.notify("Usage: /collide-deep <question or problem>", "warning");
+				return;
+			}
+			await startCollision(question, "deep", ctx);
+		},
+	});
+
+	pi.registerCommand("reroll", {
+		description: "Redraw fresh sources for the most recent collision question",
+		handler: async (_args, ctx) => {
+			if (!last) {
+				ctx.ui.notify("Nothing to reroll yet. Run /collide <question> first.", "warning");
+				return;
+			}
+			await startCollision(last.question, last.mode, ctx);
+		},
+	});
+
+	pi.registerCommand("collision-rate", {
+		description: "Rate the most recent collision: /collision-rate <fertile|dead|any short verdict>",
+		handler: async (args, ctx) => {
+			const verdict = args.trim();
+			if (!verdict) {
+				ctx.ui.notify("Usage: /collision-rate <fertile|dead|any short verdict>", "warning");
+				return;
+			}
+			const rated = rateLastEntry(ctx.cwd, verdict);
+			if (!rated) {
+				ctx.ui.notify("No collisions logged yet.", "warning");
+				return;
+			}
+			ctx.ui.notify(`Rated "${rated.sources.map((s) => s.title).join(" + ")}" as: ${verdict}`, "info");
+		},
+	});
+
+	pi.registerCommand("collision-log", {
+		description: "Show the collision draw log",
+		handler: async (_args, ctx) => {
+			pi.sendMessage(
+				{ customType: "open-collider-log", content: summarizeLog(loadLog(ctx.cwd)), display: true },
+				{ triggerTurn: false, deliverAs: "nextTurn" },
+			);
+			ctx.ui.notify("Collision log added to transcript.", "info");
 		},
 	});
 }
