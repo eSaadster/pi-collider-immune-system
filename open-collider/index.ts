@@ -1,5 +1,6 @@
 import { mkdirSync, appendFileSync, readFileSync, writeFileSync, existsSync } from "node:fs";
 import { dirname, join } from "node:path";
+import { complete } from "@earendil-works/pi-ai";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 const API_BASE = "https://en.wikipedia.org/w/api.php";
@@ -32,6 +33,28 @@ const POOL_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 const POOL_PAGES_PER_LIST = 3; // pllimit=max returns 500 links per request
 const EXTRACT_BATCH = 18; // prop=extracts with exintro caps exlimit at 20 per query
 const WILDCARD_SLOTS = 1;
+const CANDIDATE_TARGET = 24; // pool candidates gathered before structural selection
+
+// Abstract structural primitives used by Phase 0. The question is tagged with
+// these (out-of-band LLM call, never enters the session transcript), and pool
+// candidates are selected for instantiating the same primitives. Primitives
+// leak structure, not content, so Phase A stays blind to the actual question.
+const PRIMITIVES: { key: string; hint: string }[] = [
+	{ key: "feedback-loop", hint: "self-reinforcing or self-correcting cycles; compounding; spirals" },
+	{ key: "threshold-cascade", hint: "tipping points, phase transitions, nonlinear cascades" },
+	{ key: "scarcity-allocation", hint: "contested finite resources; prioritization; queues; bottlenecks" },
+	{ key: "principal-agent", hint: "misaligned incentives between deciders and doers; delegation drift" },
+	{ key: "signaling-screening", hint: "costly signals, credibility, information asymmetry, reputation" },
+	{ key: "selection-filtering", hint: "variation plus selective survival; survivorship distortions" },
+	{ key: "arms-race", hint: "adversarial co-adaptation; escalation; countermeasures" },
+	{ key: "redundancy-fragility", hint: "robustness, backups, single points of failure, cascading failure" },
+	{ key: "asymmetric-leverage", hint: "power laws, winner-take-all, small causes with outsized effects" },
+	{ key: "coordination-commons", hint: "collective action, free riding, shared-resource depletion" },
+	{ key: "gating-quarantine", hint: "boundaries, membranes, controlled exposure, staged admission" },
+	{ key: "explore-exploit", hint: "search versus optimization; diversification versus focus" },
+	{ key: "path-dependence", hint: "lock-in, irreversibility, hysteresis, switching costs" },
+	{ key: "emergence-composition", hint: "interacting parts producing qualitatively new wholes" },
+];
 
 // Wildcard (true-random) draws must positively look like a concept/mechanism;
 // pool draws are already curated, so they only need to dodge obvious junk
@@ -43,6 +66,11 @@ const DESCRIPTION_BLOCKLIST =
 const PERSON_YEARS = /\(\s*born\b|\bborn \d{4}|\b\d{2,4}\s*[–—-]\s*\d{2,4}\s*(?:BC|BCE|AD|CE)?\s*\)/i;
 
 type Mode = "standard" | "deep";
+
+// near: all slots structurally conditioned, no wildcard.
+// mid (default): conditioned pool slots + 1 unconditioned wildcard.
+// far: fully unconditioned draw (original behavior).
+type Distance = "near" | "mid" | "far";
 
 type Source = {
 	title: string;
@@ -58,6 +86,8 @@ type LogEntry = {
 	question: string;
 	sources: { title: string; url: string; origin?: string }[];
 	verdict: string | null;
+	distance?: Distance;
+	primitives?: string[];
 };
 
 type ActiveCollision = {
@@ -65,6 +95,8 @@ type ActiveCollision = {
 	mode: Mode;
 	phase: "A" | "B";
 	sources: Source[];
+	distance: Distance;
+	primitives: string[] | null;
 };
 
 type PoolEntry = { title: string; list: string };
@@ -325,12 +357,111 @@ async function fetchRandomBatch(): Promise<Source[]> {
 	});
 }
 
-async function drawSources(
-	count: number,
-	exclude: Set<string>,
-	cwd: string,
-	onPoolBuild?: () => void,
-): Promise<{ sources: Source[]; error: string | null }> {
+// Out-of-band LLM call via the session's current model. Never enters the
+// session transcript, so the main conversation stays blind to it.
+async function completeOnce(systemPrompt: string, userText: string, ctx: any): Promise<string | null> {
+	try {
+		const model = ctx.model;
+		if (!model) return null;
+		const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model);
+		if (!auth?.ok) return null;
+		const response: any = await complete(
+			model,
+			{
+				systemPrompt,
+				messages: [{ role: "user", content: [{ type: "text", text: userText }], timestamp: Date.now() }],
+			},
+			{ apiKey: auth.apiKey, headers: auth.headers },
+		);
+		const text = (Array.isArray(response?.content) ? response.content : [])
+			.filter((c: any) => c?.type === "text")
+			.map((c: any) => c.text)
+			.join("\n")
+			.trim();
+		return text || null;
+	} catch {
+		return null;
+	}
+}
+
+function extractJsonArray(text: string): any[] | null {
+	const match = text.match(/\[[\s\S]*?\]/);
+	if (!match) return null;
+	try {
+		const parsed = JSON.parse(match[0]);
+		return Array.isArray(parsed) ? parsed : null;
+	} catch {
+		return null;
+	}
+}
+
+async function tagQuestion(question: string, ctx: any): Promise<string[] | null> {
+	const ontology = PRIMITIVES.map((p) => `- ${p.key}: ${p.hint}`).join("\n");
+	const system = `You tag questions with structural primitives for a creative-collision tool. Given a question or problem statement, identify the 2-4 primitives that best describe its underlying structure: the forces, constraints, and dynamics actually at play beneath the surface topic.
+
+Available primitives:
+${ontology}
+
+Reply with ONLY a JSON array of primitive keys, e.g. ["feedback-loop","scarcity-allocation"]. No prose.`;
+	const text = await completeOnce(system, question, ctx);
+	if (!text) return null;
+	const keys = extractJsonArray(text);
+	if (!keys || !keys.every((k) => typeof k === "string")) return null;
+	const valid = [...new Set(keys)].filter((k) => PRIMITIVES.some((p) => p.key === k)).slice(0, 4);
+	return valid.length > 0 ? valid : null;
+}
+
+// Pick the candidates that structurally fit the target primitives. The
+// selector sees primitives and candidates, never the question itself.
+async function selectByStructure(
+	candidates: Source[],
+	primitives: string[],
+	take: number,
+	ctx: any,
+): Promise<Source[] | null> {
+	if (candidates.length <= take) return candidates.slice(0, take);
+	const hints = PRIMITIVES.filter((p) => primitives.includes(p.key))
+		.map((p) => `- ${p.key}: ${p.hint}`)
+		.join("\n");
+	const listing = candidates
+		.map(
+			(c, i) =>
+				`CANDIDATE ${i + 1}: ${c.title}${c.description ? ` — ${c.description}` : ""}\n${c.extract.slice(0, 500)}`,
+		)
+		.join("\n\n");
+	const system = `You select source material for a creative-collision exercise. The target's structural primitives are:
+
+${hints}
+
+From the numbered candidates, choose the ${take} whose content most strongly contains an ACTIVE causal mechanism instantiating at least one target primitive — a real mechanism in the candidate's own domain, not a thematic or surface-keyword match. Prefer topically diverse picks. Reply with ONLY a JSON array of candidate numbers, e.g. [3, 7]. No prose.`;
+	const text = await completeOnce(system, listing, ctx);
+	if (!text) return null;
+	const numbers = extractJsonArray(text);
+	if (!numbers || !numbers.every((n) => typeof n === "number")) return null;
+	const picked: Source[] = [];
+	for (const n of numbers) {
+		const candidate = candidates[n - 1];
+		if (candidate && !picked.includes(candidate)) picked.push(candidate);
+		if (picked.length >= take) break;
+	}
+	for (const candidate of candidates) {
+		if (picked.length >= take) break;
+		if (!picked.includes(candidate)) picked.push(candidate);
+	}
+	return picked.slice(0, take);
+}
+
+type DrawOptions = {
+	count: number;
+	wildcardSlots: number;
+	primitives: string[] | null; // null => unconditioned draw
+	exclude: Set<string>;
+	ctx: any;
+	onPoolBuild?: () => void;
+};
+
+async function drawSources(opts: DrawOptions): Promise<{ sources: Source[]; error: string | null }> {
+	const { count, wildcardSlots, primitives, exclude, ctx } = opts;
 	const sources: Source[] = [];
 	const seen = new Set<string>();
 	let error: string | null = null;
@@ -344,30 +475,50 @@ async function drawSources(
 		sources.push(source);
 	};
 
-	const pool = await loadPool(cwd, onPoolBuild);
+	const pool = await loadPool(ctx.cwd, opts.onPoolBuild);
 	const shuffled = interleaveByList(pool.entries).filter((e) => !exclude.has(e.title.toLowerCase()));
 	let cursor = 0;
 
-	const fillFromPool = async (target: number): Promise<void> => {
+	// Gather gated pool candidates without committing them to slots.
+	const nextCandidates = async (want: number): Promise<Source[]> => {
+		const found: Source[] = [];
 		let batches = 0;
-		while (sources.length < target && cursor < shuffled.length && batches < MAX_DRAW_ROUNDS + 1) {
+		while (found.length < want && cursor < shuffled.length && batches < MAX_DRAW_ROUNDS + 1) {
 			const batch = shuffled.slice(cursor, cursor + EXTRACT_BATCH);
 			cursor += EXTRACT_BATCH;
 			batches++;
 			try {
 				for (const source of await fetchExtractsForEntries(batch)) {
-					take(source, target, passesPoolGate);
+					const key = source.title.toLowerCase();
+					if (seen.has(key) || exclude.has(key)) continue;
+					if (!passesPoolGate(source)) continue;
+					if (found.some((s) => s.title.toLowerCase() === key)) continue;
+					found.push(source);
 				}
 			} catch (e: any) {
 				error = e?.message ?? String(e);
 			}
 		}
+		return found;
 	};
 
-	// Curated slots first, then one true-random wildcard slot gated by the
-	// description allowlist, then backfill from the pool if the wildcard ran dry.
-	await fillFromPool(Math.max(0, count - WILDCARD_SLOTS));
+	const poolSlots = Math.max(0, count - wildcardSlots);
+	let leftovers: Source[] = [];
 
+	if (primitives && poolSlots > 0) {
+		const candidates = await nextCandidates(CANDIDATE_TARGET);
+		const picked = await selectByStructure(candidates, primitives, poolSlots, ctx);
+		if (!picked && candidates.length > 0) {
+			ctx.ui.notify("Structural selection unavailable; using unconditioned pool picks.", "warning");
+		}
+		const chosen = picked ?? candidates.slice(0, poolSlots);
+		for (const source of chosen) take(source, poolSlots, () => true);
+		leftovers = candidates.filter((c) => !seen.has(c.title.toLowerCase()));
+	} else {
+		for (const source of await nextCandidates(poolSlots)) take(source, poolSlots, () => true);
+	}
+
+	// One true-random wildcard slot gated by the description allowlist.
 	for (let round = 0; round < MAX_DRAW_ROUNDS && sources.length < count; round++) {
 		try {
 			for (const source of await fetchRandomBatch()) {
@@ -378,9 +529,38 @@ async function drawSources(
 		}
 	}
 
-	await fillFromPool(count);
+	// Backfill from unselected candidates, then fresh pool batches.
+	for (const source of leftovers) take(source, count, () => true);
+	if (sources.length < count) {
+		for (const source of await nextCandidates(count - sources.length)) take(source, count, () => true);
+	}
 
 	return { sources, error };
+}
+
+function parseCollideArgs(args: string): { question: string; distance: Distance | null } {
+	let distance: Distance | null = null;
+	const tokens = args.trim().split(/\s+/).filter(Boolean);
+	const rest: string[] = [];
+	for (let i = 0; i < tokens.length; i++) {
+		const token = tokens[i];
+		const eq = token.match(/^(?:--distance|-d)=(near|mid|far)$/i);
+		if (eq) {
+			distance = eq[1].toLowerCase() as Distance;
+			continue;
+		}
+		if (/^(?:--distance|-d)$/i.test(token) && /^(near|mid|far)$/i.test(tokens[i + 1] ?? "")) {
+			distance = tokens[++i].toLowerCase() as Distance;
+			continue;
+		}
+		const short = token.match(/^--(near|mid|far)$/i);
+		if (short) {
+			distance = short[1].toLowerCase() as Distance;
+			continue;
+		}
+		rest.push(token);
+	}
+	return { question: rest.join(" "), distance };
 }
 
 function phaseAPrompt(sources: Source[], mode: Mode): string {
@@ -461,7 +641,8 @@ function summarizeLog(entries: LogEntry[]): string {
 		const date = new Date(entry.timestamp).toISOString().slice(0, 10);
 		const titles = entry.sources.map((s) => s.title).join(" + ");
 		const verdict = entry.verdict ? ` — verdict: ${entry.verdict}` : "";
-		lines.push(`- [${date}] (${entry.mode}) "${entry.question}" × ${titles}${verdict}`);
+		const tag = entry.distance ? `${entry.mode}/${entry.distance}` : entry.mode;
+		lines.push(`- [${date}] (${tag}) "${entry.question}" × ${titles}${verdict}`);
 	}
 	return lines.join("\n");
 }
@@ -480,17 +661,45 @@ function summarizePool(pool: Pool | null): string {
 
 export default function openColliderExtension(pi: ExtensionAPI) {
 	let active: ActiveCollision | null = null;
-	let last: { question: string; mode: Mode } | null = null;
+	let last: { question: string; mode: Mode; distance: Distance } | null = null;
 
-	async function startCollision(question: string, mode: Mode, ctx: any): Promise<void> {
+	async function startCollision(question: string, mode: Mode, distance: Distance, ctx: any): Promise<void> {
 		const count = mode === "deep" ? 2 : 3;
-		const curated = Math.max(0, count - WILDCARD_SLOTS);
-		ctx.ui.setStatus("open-collider", "drawing");
-		ctx.ui.notify(`Drawing ${count} sources (${curated} curated + ${WILDCARD_SLOTS} wildcard)...`, "info");
 
-		const { sources, error } = await drawSources(count, recentTitles(ctx.cwd), ctx.cwd, () =>
-			ctx.ui.notify("Building curated source pool from seed lists (first run, ~10-20s)...", "info"),
+		// Phase 0: tag the question with abstract structural primitives via an
+		// out-of-band LLM call, then condition the pool draw on them. The main
+		// conversation never sees this, so Phase A blindness is preserved.
+		let effective = distance;
+		let primitives: string[] | null = null;
+		if (effective !== "far") {
+			ctx.ui.setStatus("open-collider", "phase 0: tagging structure");
+			primitives = await tagQuestion(question, ctx);
+			if (!primitives) {
+				ctx.ui.notify("Structural tagging unavailable (no model/key or unparseable output); drawing unconditioned.", "warning");
+				effective = "far";
+			} else {
+				ctx.ui.notify(`Question structure: ${primitives.join(", ")}`, "info");
+			}
+		}
+
+		const wildcardSlots = effective === "near" ? 0 : WILDCARD_SLOTS;
+		const curated = count - wildcardSlots;
+		ctx.ui.setStatus("open-collider", "drawing");
+		const how = effective === "far" ? "random" : "structure-matched";
+		ctx.ui.notify(
+			`Drawing ${count} sources (${curated} ${how}${wildcardSlots ? ` + ${wildcardSlots} wildcard` : ""}, distance: ${effective})...`,
+			"info",
 		);
+
+		const { sources, error } = await drawSources({
+			count,
+			wildcardSlots,
+			primitives: effective === "far" ? null : primitives,
+			exclude: recentTitles(ctx.cwd),
+			ctx,
+			onPoolBuild: () =>
+				ctx.ui.notify("Building curated source pool from seed lists (first run, ~10-20s)...", "info"),
+		});
 		if (sources.length < count) {
 			ctx.ui.setStatus("open-collider", "idle");
 			const reason = error ? ` Last error: ${error}` : " All candidates were stubs; try again.";
@@ -498,8 +707,8 @@ export default function openColliderExtension(pi: ExtensionAPI) {
 			return;
 		}
 
-		active = { question, mode, phase: "A", sources };
-		last = { question, mode };
+		active = { question, mode, phase: "A", sources, distance: effective, primitives };
+		last = { question, mode, distance };
 		ctx.ui.notify(
 			`Drew: ${sources.map((s) => (s.origin === "wildcard" ? `${s.title} (wildcard)` : s.title)).join(" + ")}`,
 			"info",
@@ -532,6 +741,8 @@ export default function openColliderExtension(pi: ExtensionAPI) {
 			question: active.question,
 			sources: active.sources.map((s) => ({ title: s.title, url: s.url, origin: s.origin })),
 			verdict: null,
+			distance: active.distance,
+			primitives: active.primitives ?? undefined,
 		});
 		active = null;
 		ctx.ui.setStatus("open-collider", "idle");
@@ -550,37 +761,42 @@ export default function openColliderExtension(pi: ExtensionAPI) {
 	}
 
 	pi.registerCommand("collide", {
-		description: "Collide a question with randomly drawn external sources: /collide <question>",
+		description:
+			"Collide a question with structure-matched external sources: /collide [--distance near|mid|far] <question>",
 		handler: async (args, ctx) => {
-			const question = await resolveQuestion(args, ctx);
+			const { question: fromArgs, distance } = parseCollideArgs(args);
+			const question = await resolveQuestion(fromArgs, ctx);
 			if (!question) {
-				ctx.ui.notify("Usage: /collide <question or problem>", "warning");
+				ctx.ui.notify("Usage: /collide [--distance near|mid|far] <question or problem>", "warning");
 				return;
 			}
-			await startCollision(question, "standard", ctx);
+			await startCollision(question, "standard", distance ?? "mid", ctx);
 		},
 	});
 
 	pi.registerCommand("collide-deep", {
-		description: "Two-source intersection collision (weirder, noisier): /collide-deep <question>",
+		description:
+			"Two-source intersection collision (weirder, noisier): /collide-deep [--distance near|mid|far] <question>",
 		handler: async (args, ctx) => {
-			const question = await resolveQuestion(args, ctx);
+			const { question: fromArgs, distance } = parseCollideArgs(args);
+			const question = await resolveQuestion(fromArgs, ctx);
 			if (!question) {
-				ctx.ui.notify("Usage: /collide-deep <question or problem>", "warning");
+				ctx.ui.notify("Usage: /collide-deep [--distance near|mid|far] <question or problem>", "warning");
 				return;
 			}
-			await startCollision(question, "deep", ctx);
+			await startCollision(question, "deep", distance ?? "mid", ctx);
 		},
 	});
 
 	pi.registerCommand("reroll", {
-		description: "Redraw fresh sources for the most recent collision question",
-		handler: async (_args, ctx) => {
+		description: "Redraw fresh sources for the most recent collision question: /reroll [--distance near|mid|far]",
+		handler: async (args, ctx) => {
 			if (!last) {
 				ctx.ui.notify("Nothing to reroll yet. Run /collide <question> first.", "warning");
 				return;
 			}
-			await startCollision(last.question, last.mode, ctx);
+			const { distance } = parseCollideArgs(args);
+			await startCollision(last.question, last.mode, distance ?? last.distance, ctx);
 		},
 	});
 
